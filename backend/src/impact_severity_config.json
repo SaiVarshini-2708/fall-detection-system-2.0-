@@ -1,0 +1,20 @@
+{
+  "low": {
+    "moving": "MEDIUM",
+    "stunned": "MEDIUM",
+    "unconscious": "HIGH",
+    "unknown": "MEDIUM"
+  },
+  "medium": {
+    "moving": "MEDIUM",
+    "stunned": "HIGH",
+    "unconscious": "CRITICAL",
+    "unknown": "HIGH"
+  },
+  "high": {
+    "moving": "HIGH",
+    "stunned": "CRITICAL",
+    "unconscious": "CRITICAL",
+    "unknown": "HIGH"
+  }
+}

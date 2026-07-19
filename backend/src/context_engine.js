@@ -1,3 +1,7 @@
+import { readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
+import path from 'path';
+
 // ─────────────────────────────────────────────────────────────────────────────
 // context_engine.js
 //
@@ -63,6 +67,33 @@ const SEVERITY_MATRIX = {
   trip:  { unconscious: 'CRITICAL', stunned: 'HIGH',     moving: 'MEDIUM', unknown: 'HIGH'     },
   faint: { unconscious: 'CRITICAL', stunned: 'CRITICAL', moving: 'HIGH',   unknown: 'CRITICAL' },
 };
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const IMPACT_SEVERITY_CONFIG_PATH = path.join(__dirname, 'impact_severity_config.json');
+const IMPACT_SEVERITY_CONFIG = JSON.parse(readFileSync(IMPACT_SEVERITY_CONFIG_PATH, 'utf8'));
+
+const USE_IMPACT_BASED_SEVERITY = process.env.USE_IMPACT_BASED_SEVERITY === 'true';
+
+function bumpSeverityLevel(level) {
+  const rank = { MEDIUM: 1, HIGH: 2, CRITICAL: 3 };
+  if (rank[level] == null) return 'HIGH';
+  if (level === 'CRITICAL') return 'CRITICAL';
+  return Object.keys(rank).find((key) => rank[key] === rank[level] + 1) ?? 'HIGH';
+}
+
+function deriveSeverityFromImpactData({ severity_proxy, post_state, fall_type }) {
+  const proxyLevel = severity_proxy?.toLowerCase();
+  const postState = post_state?.toLowerCase();
+  const baseSeverity = IMPACT_SEVERITY_CONFIG?.[proxyLevel]?.[postState] ?? 'HIGH';
+
+  let severity = baseSeverity;
+  if (fall_type === 'faint') {
+    severity = bumpSeverityLevel(severity);
+  }
+
+  return severity;
+}
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -158,6 +189,19 @@ function deriveSeverity(fall_type, post_state) {
   // Look up the row (fall_type) then the column (post_state) in the 2D matrix.
   // If either key is missing (unexpected model output), fall back to 'HIGH'.
   return SEVERITY_MATRIX[fall_type]?.[post_state] ?? 'HIGH';
+}
+
+function deriveSeverityWithImpactFallback(raw) {
+  if (!USE_IMPACT_BASED_SEVERITY) {
+    return deriveSeverity(raw.fall_type, raw.post_state);
+  }
+
+  const { severity_proxy, post_state, fall_type } = raw;
+  if (severity_proxy == null || post_state == null || fall_type == null) {
+    return deriveSeverity(fall_type, post_state);
+  }
+
+  return deriveSeverityFromImpactData({ severity_proxy, post_state, fall_type });
 }
 
 
@@ -265,7 +309,8 @@ export function buildAlert(raw) {
 
   // Step 2: Determine how urgent this alert is using the severity matrix.
   // This drives the colour coding on the dashboard (red = CRITICAL, orange = HIGH, yellow = MEDIUM).
-  const severity = deriveSeverity(fall_type, post_state);
+  // The new impact-based path is opt-in and defaults to the existing behavior.
+  const severity = deriveSeverityWithImpactFallback({ fall_type, post_state, severity_proxy: raw.severity_proxy });
 
   // Step 3: Build the human-readable message that the caretaker will read.
   const message = buildMessage(fall_type, pre_activity, post_state, confidence, location);

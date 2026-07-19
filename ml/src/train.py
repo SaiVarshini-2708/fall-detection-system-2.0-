@@ -91,7 +91,7 @@ class FallWindowDataset(Dataset):
             "pre_activity": self.pre_activity[idx],
         }
 
-
+#start
 def load_data() -> tuple[np.ndarray, dict]:
     """
     Load and encode the dataset CSV.

@@ -40,12 +40,14 @@ FALL_TO_PRE_ACTIVITY: dict[str, str] = {
     "faint": "standing",  # faints happen from a standing/stationary position
 }
 
-# Thresholds for post-fall state classification based on signal stillness
-_STILLNESS_UNCONSCIOUS = 0.85
-_STILLNESS_STUNNED     = 0.55
-
-# Number of tail samples used to estimate post-fall stillness
-_POST_FALL_TAIL = 30  # 0.3 seconds at 100Hz
+# Thresholds for post-fall state classification based on continuous stillness
+# duration after a fall. The 10s/30s cutoffs are consistent with published
+# fall-detection studies that use similar inactivity-duration thresholds to
+# distinguish brief ADL movement from prolonged immobility.
+_STILLNESS_DURATION_STUNNED_SECONDS = 10.0
+_STILLNESS_DURATION_UNCONSCIOUS_SECONDS = 30.0
+_SAMPLE_RATE_HZ = 100.0
+_MOVEMENT_THRESHOLD = 0.75
 
 
 def get_fall_label(activity_code: str) -> int:
@@ -114,18 +116,17 @@ def get_pre_activity(activity_code: str) -> str:
 
 def compute_post_state(window: np.ndarray, is_fall: bool = True) -> str:
     """
-    Estimate the physical state of the person immediately after a fall.
+    Estimate the physical state of the person after a fall from the duration of
+    continuous stillness in the post-impact signal.
 
-    Method:
-      1. Compute resultant accelerometer magnitude at each timestep.
-      2. Measure variance of the magnitude over the last 30 samples (0.3s).
-      3. Convert variance to a 'stillness' score via  1 / (1 + variance).
-         High stillness → person is motionless → likely unconscious or stunned.
+    Instead of looking at only the last 0.3 seconds of the window, this version
+    measures how long the person remains motionless before movement resumes.
+    Long inactivity durations are treated as increasingly severe post-fall states.
 
     Parameters
     ----------
     window : np.ndarray
-        Shape (200, 6) float32 — one normalised IMU window.
+        Shape (n, 6) float32 — IMU signal segment.
         Columns 0-2 are acc_x, acc_y, acc_z.
     is_fall : bool
         If False (ADL window), always returns 'moving' without computation.
@@ -133,30 +134,57 @@ def compute_post_state(window: np.ndarray, is_fall: bool = True) -> str:
     Returns
     -------
     str
-        'unconscious' | 'stunned' | 'moving'
+        'unconscious' | 'stunned' | 'moving' | 'unknown'
     """
     # ADL windows never classify as unconscious or stunned
     if not is_fall:
         return "moving"
 
+    if window is None or not isinstance(window, np.ndarray):
+        return "unknown"
+
+    if window.ndim != 2 or window.shape[0] < 10 or window.shape[1] < 3:
+        return "unknown"
+
     # Extract accelerometer channels (columns 0, 1, 2)
-    acc = window[:, :3]  # shape (200, 3)
+    acc = window[:, :3].astype(np.float32)
+
+    # Normalize each axis so the movement threshold is robust for both raw and
+    # z-scored signals.
+    acc_norm = np.empty_like(acc, dtype=np.float32)
+    for axis in range(acc.shape[1]):
+        col = acc[:, axis]
+        std = float(np.std(col))
+        if std < 1e-8:
+            acc_norm[:, axis] = 0.0
+        else:
+            acc_norm[:, axis] = (col - np.mean(col)) / std
 
     # Resultant magnitude: sqrt(x² + y² + z²) at each timestep
-    acc_magnitude = np.sqrt(np.sum(acc ** 2, axis=1))  # shape (200,)
+    acc_magnitude = np.sqrt(np.sum(acc_norm ** 2, axis=1))
 
-    # Look at the tail of the window — the period just after impact
-    tail = acc_magnitude[-_POST_FALL_TAIL:]  # last 0.3 seconds
+    # Smooth with a short moving-average filter to reduce jitter.
+    smooth = acc_magnitude
+    if len(smooth) >= 5:
+        smooth = np.convolve(smooth, np.ones(5, dtype=np.float32) / 5.0, mode="same")
 
-    # Variance measures how much movement is happening
-    variance = float(np.var(tail))
+    # Ignore a brief impact buffer so the initial fall spike does not
+    # immediately collapse the stillness duration to zero.
+    impact_buffer = int(0.5 * _SAMPLE_RATE_HZ)
+    start_idx = min(max(impact_buffer, 1), len(smooth) - 1)
 
-    # Stillness score: high = barely moving, low = lots of movement
-    stillness = 1.0 / (1.0 + variance)
+    still_samples = 0
+    for value in smooth[start_idx:]:
+        if value <= _MOVEMENT_THRESHOLD:
+            still_samples += 1
+        else:
+            break
 
-    if stillness > _STILLNESS_UNCONSCIOUS:
+    still_seconds = still_samples / _SAMPLE_RATE_HZ
+
+    if still_seconds > _STILLNESS_DURATION_UNCONSCIOUS_SECONDS:
         return "unconscious"
-    elif stillness > _STILLNESS_STUNNED:
+    elif still_seconds >= _STILLNESS_DURATION_STUNNED_SECONDS:
         return "stunned"
     else:
         return "moving"
@@ -166,6 +194,10 @@ def compute_post_state(window: np.ndarray, is_fall: bool = True) -> str:
 # Standalone demo — run:  python src/labeller.py
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    from pathlib import Path
+
+    from data_loader import load_clip
+
     print("=== labeller.py demo ===")
 
     test_codes = ["F01", "F06", "F11", "D01", "D05", "D09", "UNKNOWN"]
@@ -191,3 +223,50 @@ if __name__ == "__main__":
     # ADL window always returns 'moving'
     adl_window = rng.normal(0, 1.0, (200, 6)).astype(np.float32)
     print(f"  ADL window         → {compute_post_state(adl_window, is_fall=False)}")
+
+    # Compare the old variance-based logic with the new duration-based logic
+    # on a handful of real fall clips from the SisFall dataset.
+    def _legacy_compute_post_state(window: np.ndarray, is_fall: bool = True) -> str:
+        if not is_fall:
+            return "moving"
+
+        if window is None or not isinstance(window, np.ndarray):
+            return "unknown"
+
+        if window.ndim != 2 or window.shape[0] < 30 or window.shape[1] < 3:
+            return "unknown"
+
+        acc = window[:, :3].astype(np.float32)
+        acc_magnitude = np.sqrt(np.sum(acc ** 2, axis=1))
+        tail = acc_magnitude[-30:]
+        variance = float(np.var(tail))
+        stillness = 1.0 / (1.0 + variance)
+
+        if stillness > 0.85:
+            return "unconscious"
+        elif stillness > 0.55:
+            return "stunned"
+        else:
+            return "moving"
+
+    data_root = Path(__file__).parent.parent / "data" / "SisFall_dataset"
+    if data_root.exists():
+        clip_paths = []
+        for path in sorted(data_root.rglob("*.txt")):
+            if path.name.startswith("F"):
+                clip_paths.append(path)
+                if len(clip_paths) >= 4:
+                    break
+
+        print("\nReal SisFall clip comparison (old vs new):")
+        for path in clip_paths:
+            clip = load_clip(str(path))
+            if clip is None:
+                continue
+
+            tail = clip[-min(4000, len(clip)):]
+            old_state = _legacy_compute_post_state(tail, is_fall=True)
+            new_state = compute_post_state(tail, is_fall=True)
+            print(f"  {path.name:<20} | old={old_state:<10} | new={new_state:<10}")
+    else:
+        print("\nSisFall dataset not found — skipped real-clip comparison")
