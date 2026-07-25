@@ -73,7 +73,7 @@ const __dirname = path.dirname(__filename);
 const IMPACT_SEVERITY_CONFIG_PATH = path.join(__dirname, 'impact_severity_config.json');
 const IMPACT_SEVERITY_CONFIG = JSON.parse(readFileSync(IMPACT_SEVERITY_CONFIG_PATH, 'utf8'));
 
-const USE_IMPACT_BASED_SEVERITY = process.env.USE_IMPACT_BASED_SEVERITY === 'true';
+const USE_IMPACT_BASED_SEVERITY = true;
 
 function bumpSeverityLevel(level) {
   const rank = { MEDIUM: 1, HIGH: 2, CRITICAL: 3 };
@@ -333,6 +333,10 @@ export function buildAlert(raw) {
     message,      // the sentence shown to the caretaker
     confidence,   // shown in the detail view so caretaker can judge reliability
   };
+
+  if (raw.severity_proxy != null) {
+    alert.severity_proxy = raw.severity_proxy;
+  }
 
   // confirmation_window_ms is only present on alerts that passed through the
   // adaptive confirmation window (null/undefined for alerts from mock_emitter

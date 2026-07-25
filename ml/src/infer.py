@@ -350,7 +350,36 @@ def simulate_robot_patrol(wearable_id: str, true_room: str | None = None) -> str
     return result_str
 
 
-def send_alert(result: dict, post_state: str, confirmation_window_ms: int | None = None, location: str | None = None) -> None:
+def _derive_severity_proxy(window: np.ndarray | None) -> str | None:
+    """Derive a lightweight impact-based proxy from a 2-second IMU window."""
+    if window is None:
+        return None
+
+    if window.ndim != 2 or window.shape[0] < 2 or window.shape[1] < 3:
+        return None
+
+    acc_xyz = window[:, :3]
+    magnitude = np.sqrt(np.sum(acc_xyz ** 2, axis=1))
+
+    peak_acc_g = float(np.max(magnitude))
+    if not np.isfinite(peak_acc_g):
+        return None
+
+    if peak_acc_g >= 6.0:
+        return "high"
+    if peak_acc_g >= 3.5:
+        return "medium"
+    return "low"
+
+
+def send_alert(
+    result: dict,
+    post_state: str,
+    confirmation_window_ms: int | None = None,
+    location: str | None = None,
+    severity_proxy: str | None = None,
+    window: np.ndarray | None = None,
+) -> None:
     """
     POST a fall alert to the backend API.
 
@@ -360,6 +389,7 @@ def send_alert(result: dict, post_state: str, confirmation_window_ms: int | None
       { confirmation_window_ms }  — only present for confirmed falls that passed
                                     the adaptive confirmation window.
       { location }                — room name from BLE patrol, or "location_unknown".
+      { severity_proxy }          — optional impact-based proxy severity label.
 
     Handles connection errors gracefully — inference continues even
     when the backend is unreachable (e.g. during standalone testing).
@@ -376,6 +406,9 @@ def send_alert(result: dict, post_state: str, confirmation_window_ms: int | None
     location : str or None
         Room name returned by simulate_robot_patrol(), or "location_unknown".
         Omitted when None (e.g. in standalone tests that skip the patrol).
+    severity_proxy : str or None
+        Optional impact-based proxy severity label such as "low", "medium", or "high".
+        Omitted from the payload when None.
     """
     payload = {
         "fall_type":    result["fall_type"],
@@ -387,6 +420,11 @@ def send_alert(result: dict, post_state: str, confirmation_window_ms: int | None
         payload["confirmation_window_ms"] = confirmation_window_ms
     if location is not None:
         payload["location"] = location
+
+    if severity_proxy is None:
+        severity_proxy = _derive_severity_proxy(window)
+    if severity_proxy is not None:
+        payload["severity_proxy"] = severity_proxy
 
     url = f"{BACKEND_URL}/api/alert"
 
@@ -592,7 +630,13 @@ def run_simulation(dataset_csv: str = None) -> None:
         # representing a real unknown-location scenario.
         location = simulate_robot_patrol(WEARABLE_BLE_ID)
 
-        send_alert(result, post_state, confirmation_window_ms=conf_window_ms, location=location)
+        send_alert(
+            result,
+            post_state,
+            confirmation_window_ms=conf_window_ms,
+            location=location,
+            window=window,
+        )
         alerts_sent += 1
 
         # Simulate real-time gap between fall events
